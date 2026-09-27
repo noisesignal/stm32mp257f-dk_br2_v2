@@ -1,0 +1,148 @@
+mailbox: stm32-ipcc: split each physical channel into RX/TX mailbox sub-channels
+
+vq0 and vq1 (rpmsg virtqueues for the M33 remoteproc link) were each
+assigned their own whole physical IPCC channel (vq0=channel 0,
+vq1=channel 1). The IPCC hardware only exposes 2 physical interrupt
+lines total (one "RX occupied", one "TX free", shared across all
+channels via a status register), so this wastes a channel: vq0 and
+vq1 could instead share one physical channel, using its RX half for
+one direction and its TX half for the other - full-duplex on a
+single channel, same approach already used and validated on the
+MP157/M4 side (see mon-br2-external's own
+0001-stm32-ipcc-fix-mailbox.patch for that board).
+
+Doubles controller.num_chans and maps mailbox index N to physical
+channel N/2, direction N&1 (even=RX, odd=TX) in stm32_ipcc_xlate().
+rx_irq()/tx_irq() dispatch accordingly. RIF security checks and all
+XSCR/XMR/XTOYSR register operations keep using the recovered
+physical channel (N/2), never the raw doubled mailbox index -
+those registers are only 16 bits wide (one bit per real hardware
+channel), so using the doubled index directly there would corrupt
+unrelated channels.
+
+startup()/shutdown() track which direction (chnl->is_tx) each
+mbox_chan represents so releasing one sub-channel only masks its
+own direction - masking both on shutdown would silently kill the
+sibling sub-channel's still-active notifications when two of them
+share a physical channel.
+
+No devicetree change needed: the existing stm32mp257f-dk.dts mboxes
+values for vq0/vq1/shutdown (0x100, 0x101, 2) already resolve, once
+divided by 2, to physical channels 0, 0, 1 respectively - vq0 and
+vq1 land on the same physical channel purely as a side effect of
+this new index math, with no DT edit required.
+
+Validated on hardware: RPMsg (echo/cat over /dev/ttyRPMSG0, with
+matching bare_lora_m33 firmware changes) works end-to-end, reply
+content correct across repeated cycles.
+
+--- a/drivers/mailbox/stm32-ipcc.c
++++ b/drivers/mailbox/stm32-ipcc.c
+@@ -70,6 +70,12 @@
+ 	struct work_struct rx_work;
+ 	unsigned long      chan;
+ 	bool               irq_ctx;
++	/* Set in stm32_ipcc_xlate() from the mailbox index parity. When two
++	 * mbox_chan share one physical IPCC channel (RX sub-channel + TX
++	 * sub-channel), each side's startup()/shutdown() must only touch
++	 * its own direction's mask bit - not both - or releasing one side
++	 * silently kills notifications for the other, still-active side. */
++	bool               is_tx;
+ };
+ 
+ struct stm32_ipcc {
+@@ -147,7 +153,11 @@
+ 			ipcc->sys_wkup = false;
+ 		}
+ 
+-		chnl = &ipcc->chnl[chan];
++		/* RX sub-channel of physical channel `chan` is mailbox index
++		 * chan*2 (even), so vq0 (RX) and vq1 (TX) of a single IPCC
++		 * channel can be split into two independent mbox_chan, each
++		 * with its own client - see stm32_ipcc_xlate(). */
++		chnl = &ipcc->chnl[chan * 2];
+ 
+ 		/*
+ 		 * Depending on the DT parameter,call the client under interrupt context
+@@ -191,7 +201,9 @@
+ 		stm32_ipcc_set_bits(&ipcc->lock, ipcc->reg_proc + IPCC_XMR,
+ 				    TX_BIT_CHAN(chan));
+ 
+-		mbox_chan_txdone(&ipcc->controller.chans[chan], 0);
++		/* TX sub-channel of physical channel `chan` is mailbox index
++		 * chan*2+1 (odd) - see stm32_ipcc_xlate(). */
++		mbox_chan_txdone(&ipcc->controller.chans[chan * 2 + 1], 0);
+ 
+ 		ret = IRQ_HANDLED;
+ 	}
+@@ -235,9 +247,14 @@
+ 		return ret;
+ 	}
+ 
+-	/* unmask 'rx channel occupied' interrupt */
+-	stm32_ipcc_clr_bits(&ipcc->lock, ipcc->reg_proc + IPCC_XMR,
+-			    RX_BIT_CHAN(chan));
++	/* unmask 'rx channel occupied' interrupt - only meaningful for the
++	 * RX sub-channel; the TX sub-channel unmasks its own bit per-send,
++	 * in stm32_ipcc_send_data(). Touching RX_BIT_CHAN from the TX side
++	 * would be harmless here (idempotent), but is skipped for symmetry
++	 * with shutdown(), which cannot afford to be careless about it. */
++	if (!chnl->is_tx)
++		stm32_ipcc_clr_bits(&ipcc->lock, ipcc->reg_proc + IPCC_XMR,
++				    RX_BIT_CHAN(chan));
+ 
+ 	return 0;
+ }
+@@ -249,9 +266,13 @@
+ 	struct stm32_ipcc *ipcc = container_of(link->mbox, struct stm32_ipcc,
+ 					       controller);
+ 
+-	/* mask rx/tx interrupt */
++	/* Mask only this sub-channel's own direction. When two mbox_chan
++	 * share one physical channel (RX sub-channel + TX sub-channel),
++	 * masking both here would silently kill the sibling sub-channel's
++	 * notifications if it is released independently and is still in
++	 * use - see stm32_ipcc_ch.is_tx. */
+ 	stm32_ipcc_set_bits(&ipcc->lock, ipcc->reg_proc + IPCC_XMR,
+-			    RX_BIT_CHAN(chan) | TX_BIT_CHAN(chan));
++			    chnl->is_tx ? TX_BIT_CHAN(chan) : RX_BIT_CHAN(chan));
+ 
+ 	if (!chnl->irq_ctx)
+ 		flush_work(&chnl->rx_work);
+@@ -303,12 +324,19 @@
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	chnl = (struct stm32_ipcc_ch *)mbox->chans[ind].con_priv;
+-	ret = stm32_ipcc_check_rif(ipcc, ind);
++
++	/* `ind` is now a mailbox index over the doubled (RX/TX sub-channel)
++	 * space, not a physical IPCC channel number - RIF security config
++	 * and the XSCR/XMR/XTOYSR bit operations (stm32_ipcc_send_data(),
++	 * stm32_ipcc_startup(), stm32_ipcc_shutdown()) only exist per
++	 * physical channel, so recover it here. */
++	ret = stm32_ipcc_check_rif(ipcc, ind / 2);
+ 	if (ret)
+ 		return ERR_PTR(ret);
+ 
+ 	chnl->mbox = &mbox->chans[ind];
+-	chnl->chan = ind;
++	chnl->chan = ind / 2;
++	chnl->is_tx = ind & 1;
+ 	chnl->irq_ctx = !!(sp->args[0] & STM32_IPCC_CH_HIGH_PRIO_MASK);
+ 
+ 	if (!chnl->irq_ctx)
+@@ -432,7 +460,13 @@
+ 	ipcc->controller.txdone_irq = true;
+ 	ipcc->controller.ops = &stm32_ipcc_ops;
+ 	ipcc->controller.of_xlate = &stm32_ipcc_xlate;
+-	ipcc->controller.num_chans = ipcc->n_chans;
++	/* Each physical IPCC channel is split into two independent mailbox
++	 * channels (RX sub-channel at index chan*2, TX sub-channel at
++	 * chan*2+1), so a single IPCC channel can carry full-duplex traffic
++	 * for two different rpmsg virtqueues instead of needing one whole
++	 * channel per direction. See stm32_ipcc_rx_irq()/stm32_ipcc_tx_irq()
++	 * and stm32_ipcc_xlate(). */
++	ipcc->controller.num_chans = ipcc->n_chans * 2;
+ 	ipcc->controller.chans = devm_kcalloc(dev, ipcc->controller.num_chans,
+ 					      sizeof(*ipcc->controller.chans),
+ 					      GFP_KERNEL);
