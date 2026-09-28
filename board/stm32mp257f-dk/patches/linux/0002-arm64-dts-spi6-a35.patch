@@ -1,0 +1,12 @@
+--- a/arch/arm64/boot/dts/st/stm32mp257f-dk.dts
++++ b/arch/arm64/boot/dts/st/stm32mp257f-dk.dts
+@@ -839,1 +839,8 @@
+-	status = "disabled";
++	cs-gpios = <&gpiof 4 GPIO_ACTIVE_LOW>;
++	status = "okay";
++
++	spidev@0 {
++		compatible = "semtech,sx1301";
++		reg = <0>;
++		spi-max-frequency = <10000000>;
++	};
