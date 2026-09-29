@@ -1,0 +1,4 @@
+config BR2_PACKAGE_LORA_A35
+	bool "lora-A35"
+	help
+	  LoRa application for A35.

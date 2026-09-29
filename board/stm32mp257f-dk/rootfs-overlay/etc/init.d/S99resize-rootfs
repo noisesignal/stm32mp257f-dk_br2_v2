@@ -1,0 +1,261 @@
+#!/bin/sh
+#
+# S99resize-rootfs
+#
+# Grow the root filesystem partition and its ext4 filesystem so that
+# the rootfs uses all remaining space on the eMMC.
+#
+# Designed for Buildroot / BusyBox init.
+#
+# Operation:
+#
+#   Boot 1:
+#     1. Detect the block device containing "/".
+#     2. Fix the GPT if the flashed image is smaller than the eMMC.
+#     3. Check that rootfs is the last GPT partition.
+#     4. Extend that partition to 100% of the disk.
+#     5. Create a stage marker.
+#     6. Reboot.
+#
+#   Boot 2:
+#     1. Detect the stage marker.
+#     2. Run resize2fs on the mounted ext4 rootfs.
+#     3. Create the final marker.
+#
+#   Following boots:
+#     Exit immediately.
+#
+# The existing GPT partition is resized rather than recreated, so its
+# PARTUUID is preserved.
+#
+
+MARKER="/etc/.rootfs_resized"
+STAGE_FILE="/etc/.rootfs_resize_stage"
+
+log()
+{
+	echo "resize-rootfs: $*"
+}
+
+fail()
+{
+	log "ERROR: $*"
+	exit 1
+}
+
+case "$1" in
+	start)
+		;;
+	stop|restart|reload)
+		exit 0
+		;;
+	*)
+		echo "Usage: $0 start"
+		exit 1
+		;;
+esac
+
+
+#
+# Already completed.
+#
+
+if [ -e "$MARKER" ]; then
+	exit 0
+fi
+
+
+#
+# Required programs.
+#
+
+command -v parted >/dev/null 2>&1 ||
+	fail "parted not found"
+
+command -v resize2fs >/dev/null 2>&1 ||
+	fail "resize2fs not found"
+
+
+#
+# Determine the block device mounted on "/".
+#
+# Example on STM32MP257F-DK:
+#
+#   MAJMIN   = 179:3
+#   SYS_PART = .../block/mmcblk1/mmcblk1p3
+#   PART_DEV = /dev/mmcblk1p3
+#   DISK     = /dev/mmcblk1
+#   PART     = 3
+#
+
+MAJMIN=$(awk '$5 == "/" { print $3; exit }' /proc/self/mountinfo)
+
+[ -n "$MAJMIN" ] ||
+	fail "cannot determine root filesystem major/minor"
+
+SYS_PART=$(readlink -f "/sys/dev/block/$MAJMIN")
+
+[ -n "$SYS_PART" ] ||
+	fail "cannot resolve /sys/dev/block/$MAJMIN"
+
+[ -f "$SYS_PART/partition" ] ||
+	fail "root filesystem is not on a normal disk partition"
+
+PART=$(cat "$SYS_PART/partition")
+
+[ -n "$PART" ] ||
+	fail "cannot determine partition number"
+
+PART_NAME=$(basename "$SYS_PART")
+DISK_NAME=$(basename "$(dirname "$SYS_PART")")
+
+PART_DEV="/dev/$PART_NAME"
+DISK="/dev/$DISK_NAME"
+
+[ -b "$PART_DEV" ] ||
+	fail "$PART_DEV is not a block device"
+
+[ -b "$DISK" ] ||
+	fail "$DISK is not a block device"
+
+
+#
+# Make sure "/" really is ext4.
+#
+
+ROOT_FSTYPE=$(
+	awk '
+		$5 == "/" {
+			for (i = 1; i <= NF; i++) {
+				if ($i == "-") {
+					print $(i + 1)
+					exit
+				}
+			}
+		}
+	' /proc/self/mountinfo
+)
+
+[ "$ROOT_FSTYPE" = "ext4" ] ||
+	fail "root filesystem is '$ROOT_FSTYPE', expected ext4"
+
+
+log "root filesystem: $PART_DEV"
+log "parent disk:     $DISK"
+log "partition:       $PART"
+
+
+#
+# SECOND BOOT
+#
+# The GPT partition has already been extended.
+# Grow ext4 online.
+#
+
+if [ -e "$STAGE_FILE" ]; then
+
+	log "growing ext4 filesystem on $PART_DEV"
+
+	if resize2fs "$PART_DEV"; then
+
+		#
+		# Write the final marker BEFORE deleting the stage marker.
+		# This makes recovery from a power loss safer.
+		#
+
+		if ! touch "$MARKER"; then
+			fail "cannot create $MARKER"
+		fi
+
+		sync
+
+		rm -f "$STAGE_FILE"
+		sync
+
+		log "filesystem resize completed successfully"
+		exit 0
+	else
+		fail "resize2fs failed"
+	fi
+fi
+
+
+#
+# FIRST BOOT
+#
+# A Buildroot disk image can contain a GPT whose backup header still
+# corresponds to the image size instead of the real eMMC size.
+#
+# GNU parted -s -f automatically answers "Fix" to this condition.
+#
+
+log "checking/fixing GPT on $DISK"
+
+if ! parted -s -f "$DISK" print >/dev/null 2>&1; then
+	fail "unable to fix/read GPT on $DISK"
+fi
+
+
+#
+# Ensure rootfs is the LAST GPT partition.
+#
+# Extending a partition to 100% is safe only if no partition follows it.
+#
+
+LAST_PART=$(
+	parted -m -s "$DISK" unit s print 2>/dev/null |
+	awk -F: '
+		$1 ~ /^[0-9]+$/ {
+			last = $1
+		}
+		END {
+			print last
+		}
+	'
+)
+
+[ -n "$LAST_PART" ] ||
+	fail "cannot determine last partition on $DISK"
+
+if [ "$PART" != "$LAST_PART" ]; then
+	fail "root partition $PART is not the last partition on $DISK (last is $LAST_PART)"
+fi
+
+
+#
+# Extend the root partition.
+#
+# parted refuses resizepart in --script mode when the partition is
+# currently mounted.  Since "/" obviously is mounted, use parted's
+# pretend-input-tty mode and explicitly answer "yes" to the warning.
+#
+# The GPT has already been fixed above, so the only expected question
+# here is confirmation that the mounted partition may be modified.
+#
+
+log "growing $PART_DEV to the end of $DISK"
+
+if printf 'yes\n' |
+	parted ---pretend-input-tty "$DISK" resizepart "$PART" 100%
+then
+	log "partition resize completed"
+else
+	fail "partition resize failed"
+fi
+
+
+#
+# Do not continue unless the state can be persisted.
+#
+
+if ! touch "$STAGE_FILE"; then
+	fail "partition was resized but cannot create $STAGE_FILE"
+fi
+
+sync
+
+log "partition resized successfully; rebooting"
+
+reboot
+
+exit 0

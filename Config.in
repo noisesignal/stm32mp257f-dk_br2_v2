@@ -1,0 +1,5 @@
+menu "MAINEXTERNAL packages"
+
+source "$BR2_EXTERNAL_MAINEXTERNAL_PATH/package/lora-A35/Config.in"
+
+endmenu
